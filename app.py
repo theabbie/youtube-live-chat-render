@@ -206,9 +206,12 @@ def firebase_root():
     )
 
 
+def message_key(message_id):
+    return hashlib.sha256(message_id.encode()).hexdigest()
+
+
 def message_ref(message_id):
-    key = hashlib.sha256(message_id.encode()).hexdigest()
-    return firebase_root().child("messages").child(key)
+    return firebase_root().child("messages").child(message_key(message_id))
 
 
 def claim_message(candidate):
@@ -535,6 +538,8 @@ def chat_messages(chat_id, page_token=None):
 
 def claim_one_message(chat_id):
     response = chat_messages(chat_id)
+    existing = firebase_root().child("messages").get() or {}
+    now = time.time()
     candidates = []
     for item in response.get("items", []):
         message_id = item.get("id")
@@ -548,6 +553,15 @@ def claim_one_message(chat_id):
         text = snippet.get("displayMessage", "").strip()
         if not published_at or not text:
             continue
+        saved = existing.get(message_key(message_id))
+        if saved:
+            status = saved.get("status")
+            stale = (
+                status == "processing"
+                and now - float(saved.get("claimedAt", 0)) > 300
+            )
+            if status not in ("pending", "failed") and not stale:
+                continue
         author = item.get("authorDetails", {}).get("displayName", "viewer")
         candidates.append(
             {
