@@ -1,2 +1,2 @@
 Pillow==11.3.0
-
+firebase-admin==7.5.0

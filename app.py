@@ -3,6 +3,7 @@
 
 import colorsys
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -15,16 +16,18 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import firebase_admin
+from firebase_admin import credentials, db
 from PIL import Image, ImageDraw, ImageFont
 
 
 API_ROOT = "https://www.googleapis.com/youtube/v3"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 WIDTH, HEIGHT, INPUT_FPS = 1280, 720, 2
-STATE_FILE = Path(os.environ.get("STATE_FILE", "/tmp/youtube-live-state.json"))
 REGULAR_FONT = next(
     path
     for path in (
@@ -46,6 +49,7 @@ job_lock = threading.Lock()
 request_lock = threading.Lock()
 status_lock = threading.Lock()
 current_stop = None
+firebase_lock = threading.Lock()
 runtime_status = {
     "running": False,
     "startedAt": None,
@@ -151,22 +155,11 @@ def transition(status):
     )
 
 
-def load_local_state():
-    try:
-        data = json.loads(STATE_FILE.read_text())
-        return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
-
-
 class ScreenState:
     def __init__(self):
-        saved = load_local_state().get("display", {})
-        self.author = saved.get("author", "")
-        self.question = saved.get("question", "Send a message in live chat")
-        self.answer = saved.get(
-            "answer", "Up to three messages are answered during each run."
-        )
+        self.author = ""
+        self.question = "Send a message in live chat"
+        self.answer = "Each new message is answered in its own short stream segment."
         self.status = "CONNECTING"
         self.version = 0
         self.lock = threading.Lock()
@@ -192,29 +185,83 @@ class ScreenState:
             )
 
 
-def load_processed():
-    return list(load_local_state().get("processedMessageIds", []))[-500:]
+def utc_now():
+    return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-def save_local_state(ids, state=None, last_processed_at=None):
-    current = load_local_state()
-    display = current.get("display", {})
-    if state:
-        author, question, answer, _status, _version = state.get()
-        display = {"author": author, "question": question, "answer": answer}
-    cursor = last_processed_at or current.get("lastProcessedAt")
-    temp = STATE_FILE.with_suffix(".tmp")
-    temp.write_text(
-        json.dumps(
-            {
-                "processedMessageIds": list(ids)[-500:],
-                "display": display,
-                "lastProcessedAt": cursor,
-                "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
-            }
-        )
+def firebase_root():
+    with firebase_lock:
+        if not firebase_admin._apps:
+            service_account = json.loads(required("FIREBASE_SERVICE_ACCOUNT"))
+            firebase_admin.initialize_app(
+                credentials.Certificate(service_account),
+                {
+                    "databaseURL": (
+                        f"https://{service_account['project_id']}.firebaseio.com"
+                    )
+                },
+            )
+    return db.reference(
+        f"youtubeLiveChatAI/{required('YOUTUBE_BROADCAST_ID')}"
     )
-    temp.replace(STATE_FILE)
+
+
+def message_ref(message_id):
+    key = hashlib.sha256(message_id.encode()).hexdigest()
+    return firebase_root().child("messages").child(key)
+
+
+def claim_message(candidate):
+    claim_token = uuid.uuid4().hex
+    now = time.time()
+
+    def transaction(current):
+        if current is None or current.get("status") in ("pending", "failed"):
+            return {
+                "messageId": candidate["message_id"],
+                "author": candidate["author"],
+                "text": candidate["text"],
+                "publishedAt": candidate["published_at"],
+                "status": "processing",
+                "claimToken": claim_token,
+                "claimedAt": now,
+                "updatedAt": utc_now(),
+            }
+        if (
+            current.get("status") == "processing"
+            and now - float(current.get("claimedAt", 0)) > 300
+        ):
+            current.update(
+                {
+                    "status": "processing",
+                    "claimToken": claim_token,
+                    "claimedAt": now,
+                    "updatedAt": utc_now(),
+                }
+            )
+            return current
+        return current
+
+    result = message_ref(candidate["message_id"]).transaction(transaction)
+    if result.get("claimToken") == claim_token:
+        candidate["claim_token"] = claim_token
+        return candidate
+    return None
+
+
+def finish_claim(candidate, status, **values):
+    reference = message_ref(candidate["message_id"])
+    claim_token = candidate["claim_token"]
+
+    def transaction(current):
+        if not current or current.get("claimToken") != claim_token:
+            return current
+        current.update({"status": status, "updatedAt": utc_now(), **values})
+        if status != "processing":
+            current.pop("claimToken", None)
+        return current
+
+    reference.transaction(transaction)
 
 
 def visible_answer(text):
@@ -486,18 +533,7 @@ def chat_messages(chat_id, page_token=None):
     return youtube_api("GET", "/liveChat/messages", params)
 
 
-def generate_up_to_three(chat_id, stop):
-    local_state = load_local_state()
-    processed = list(local_state.get("processedMessageIds", []))[-500:]
-    processed_set = set(processed)
-    last_processed_at = local_state.get("lastProcessedAt")
-    if not last_processed_at:
-        last_processed_at = dt.datetime.now(dt.timezone.utc).isoformat(
-            timespec="milliseconds"
-        ).replace("+00:00", "Z")
-        save_local_state(processed, last_processed_at=last_processed_at)
-    count = 0
-    cards = []
+def claim_one_message(chat_id):
     response = chat_messages(chat_id)
     candidates = []
     for item in response.get("items", []):
@@ -505,64 +541,38 @@ def generate_up_to_three(chat_id, stop):
         snippet = item.get("snippet", {})
         if (
             not message_id
-            or message_id in processed_set
             or snippet.get("type") != "textMessageEvent"
         ):
             continue
         published_at = snippet.get("publishedAt", "")
-        if not published_at or published_at < last_processed_at:
-            continue
         text = snippet.get("displayMessage", "").strip()
-        if not text:
+        if not published_at or not text:
             continue
         author = item.get("authorDetails", {}).get("displayName", "viewer")
-        candidates.append((published_at, message_id, author, text))
-    candidates.sort()
-    for published_at, message_id, author, text in candidates[:3]:
-        if stop.is_set():
-            break
-        processed.append(message_id)
-        processed_set.add(message_id)
-        if published_at > last_processed_at:
-            last_processed_at = published_at
-        save_local_state(processed, last_processed_at=last_processed_at)
-        count += 1
-        with status_lock:
-            runtime_status["processedThisRun"] = count
-        try:
-            answer = exa_answer(text, lambda _current: None)
-            answer = answer or "I couldn’t produce an answer for that message."
-            card_status = "ANSWERED"
-        except Exception as exc:
-            print(f"LLM error for {message_id}: {exc}", file=sys.stderr, flush=True)
-            answer = "The AI service is temporarily unavailable."
-            card_status = "ERROR"
-        card = {
-            "author": author,
-            "question": text,
-            "answer": answer,
-            "status": card_status,
-        }
-        cards.append(card)
-        saved_state = ScreenState()
-        saved_state.set(**card)
-        save_local_state(
-            processed, saved_state, last_processed_at=last_processed_at
+        candidates.append(
+            {
+                "published_at": published_at,
+                "message_id": message_id,
+                "author": author,
+                "text": text,
+            }
         )
-    return cards
+    for candidate in sorted(candidates, key=lambda item: item["published_at"]):
+        claimed = claim_message(candidate)
+        if claimed:
+            return claimed
+    return None
 
 
-def send_cards(stream, lifecycle, cards, stop):
+def send_card(stream, lifecycle, card, stop):
     state = ScreenState()
-    if cards:
-        state.set(**cards[0])
-    else:
-        state.set(status="LATEST")
+    state.set(**card)
     process = subprocess.Popen(ffmpeg_command(stream), stdin=subprocess.PIPE)
     feeder = threading.Thread(
         target=feed_video, args=(process, state, stop), daemon=True
     )
     feeder.start()
+    displayed = False
     try:
         deadline = time.time() + 75
         while time.time() < deadline and not stop.is_set():
@@ -576,18 +586,12 @@ def send_cards(stream, lifecycle, cards, stop):
             stop.wait(3)
         else:
             if stop.is_set():
-                return
+                return False
             raise RuntimeError("YouTube did not accept ingest within 75 seconds.")
 
-        hold_seconds = max(5, min(30, int(os.environ.get("CARD_SECONDS", "12"))))
-        if cards:
-            for card in cards:
-                if stop.is_set():
-                    break
-                state.set(**card)
-                stop.wait(hold_seconds)
-        else:
-            stop.wait(max(5, min(15, int(os.environ.get("IDLE_SECONDS", "8")))))
+        hold_seconds = max(2, min(10, int(os.environ.get("CARD_SECONDS", "3"))))
+        displayed = not stop.wait(hold_seconds)
+        return displayed
     finally:
         stop.set()
         feeder.join(timeout=3)
@@ -628,9 +632,38 @@ def run_stream_job(stop):
         chat_id = broadcast.get("snippet", {}).get("liveChatId")
         if not chat_id:
             raise RuntimeError("Broadcast has no live chat ID.")
-        cards = generate_up_to_three(chat_id, stop)
-        if not stop.is_set():
-            send_cards(stream, lifecycle, cards, stop)
+        candidate = claim_one_message(chat_id)
+        if candidate is None or stop.is_set():
+            if candidate is not None:
+                finish_claim(candidate, "pending", retryReason="superseded")
+            return
+        try:
+            answer = exa_answer(candidate["text"], lambda _current: None)
+            if stop.is_set():
+                finish_claim(candidate, "pending", retryReason="superseded")
+                return
+            answer = answer or "I couldn’t produce an answer for that message."
+            card = {
+                "author": candidate["author"],
+                "question": candidate["text"],
+                "answer": answer,
+                "status": "ANSWERED",
+            }
+            displayed = send_card(stream, lifecycle, card, stop)
+            if displayed:
+                finish_claim(
+                    candidate,
+                    "answered",
+                    answer=answer,
+                    answeredAt=utc_now(),
+                )
+                with status_lock:
+                    runtime_status["processedThisRun"] = 1
+            else:
+                finish_claim(candidate, "pending", retryReason="superseded")
+        except Exception as exc:
+            finish_claim(candidate, "pending", retryReason=str(exc)[:300])
+            raise
     except Exception as exc:
         print(f"Stream job failed: {exc}", file=sys.stderr, flush=True)
         with status_lock:
