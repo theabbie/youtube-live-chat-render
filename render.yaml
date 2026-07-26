@@ -22,7 +22,7 @@ services:
       - key: FIREBASE_SERVICE_ACCOUNT
         sync: false
       - key: CARD_SECONDS
-        value: "3"
+        value: "10"
       - key: EXA_ENDPOINT
         value: https://demos.exa.ai/chatbot-demo/api/chat/stream
       - key: EXA_MODEL

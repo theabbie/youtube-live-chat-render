@@ -18,17 +18,19 @@ without opening two simultaneous connections to the same YouTube stream key.
 ## State and concurrency
 
 YouTube resource IDs and OAuth credentials are Render environment variables.
-Message state lives at
-`/youtubeLiveChatAI/<broadcast-id>/messages` in Firebase Realtime Database.
-Transactional claims prevent overlapping workers from answering the same
-message. Interrupted claims return to `pending`; abandoned `processing` claims
-can be reclaimed after five minutes.
+Firebase stores only the last answered message ID and publication timestamp,
+plus a temporary processing lease while a response is in flight. No chat text,
+usernames, or generated answers are retained. Transactional claims prevent
+overlapping workers from answering the same message; abandoned leases can be
+reclaimed after five minutes.
 
 ## Endpoints
 
 - `GET /health` — process status, with no secrets
 - `POST /tick` — starts a job when authorized with
   `Authorization: Bearer $CRON_SHARED_SECRET`
+- `POST /tick?delay=30` — schedules the same job 30 seconds later, used with a
+  second whole-minute cron schedule to produce a 90-second cadence
 
 ## Environment
 

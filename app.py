@@ -3,7 +3,6 @@
 
 import colorsys
 import datetime as dt
-import hashlib
 import json
 import math
 import os
@@ -185,10 +184,6 @@ class ScreenState:
             )
 
 
-def utc_now():
-    return dt.datetime.now(dt.timezone.utc).isoformat()
-
-
 def firebase_root():
     with firebase_lock:
         if not firebase_admin._apps:
@@ -206,12 +201,8 @@ def firebase_root():
     )
 
 
-def message_key(message_id):
-    return hashlib.sha256(message_id.encode()).hexdigest()
-
-
-def message_ref(message_id):
-    return firebase_root().child("messages").child(message_key(message_id))
+def state_ref():
+    return firebase_root().child("state")
 
 
 def claim_message(candidate):
@@ -219,52 +210,51 @@ def claim_message(candidate):
     now = time.time()
 
     def transaction(current):
-        if current is None or current.get("status") in ("pending", "failed"):
-            return {
+        current = current or {}
+        processing = current.get("processing")
+        if (
+            processing
+            and now - float(processing.get("claimedAt", 0)) <= 300
+        ):
+            return current
+        cursor = (
+            current.get("lastRespondedPublishedAt", ""),
+            current.get("lastRespondedMessageId", ""),
+        )
+        position = (candidate["published_at"], candidate["message_id"])
+        if position <= cursor:
+            return current
+        current["processing"] = {
                 "messageId": candidate["message_id"],
-                "author": candidate["author"],
-                "text": candidate["text"],
                 "publishedAt": candidate["published_at"],
-                "status": "processing",
                 "claimToken": claim_token,
                 "claimedAt": now,
-                "updatedAt": utc_now(),
-            }
-        if (
-            current.get("status") == "processing"
-            and now - float(current.get("claimedAt", 0)) > 300
-        ):
-            current.update(
-                {
-                    "status": "processing",
-                    "claimToken": claim_token,
-                    "claimedAt": now,
-                    "updatedAt": utc_now(),
-                }
-            )
-            return current
+        }
         return current
 
-    result = message_ref(candidate["message_id"]).transaction(transaction)
-    if result.get("claimToken") == claim_token:
+    result = state_ref().transaction(transaction)
+    if result.get("processing", {}).get("claimToken") == claim_token:
         candidate["claim_token"] = claim_token
         return candidate
     return None
 
 
-def finish_claim(candidate, status, **values):
-    reference = message_ref(candidate["message_id"])
+def finish_claim(candidate, answered):
     claim_token = candidate["claim_token"]
 
     def transaction(current):
-        if not current or current.get("claimToken") != claim_token:
+        if (
+            not current
+            or current.get("processing", {}).get("claimToken") != claim_token
+        ):
             return current
-        current.update({"status": status, "updatedAt": utc_now(), **values})
-        if status != "processing":
-            current.pop("claimToken", None)
+        current.pop("processing", None)
+        if answered:
+            current["lastRespondedMessageId"] = candidate["message_id"]
+            current["lastRespondedPublishedAt"] = candidate["published_at"]
         return current
 
-    reference.transaction(transaction)
+    state_ref().transaction(transaction)
 
 
 def visible_answer(text):
@@ -538,8 +528,11 @@ def chat_messages(chat_id, page_token=None):
 
 def claim_one_message(chat_id):
     response = chat_messages(chat_id)
-    existing = firebase_root().child("messages").get() or {}
-    now = time.time()
+    state = state_ref().get() or {}
+    cursor = (
+        state.get("lastRespondedPublishedAt", ""),
+        state.get("lastRespondedMessageId", ""),
+    )
     candidates = []
     for item in response.get("items", []):
         message_id = item.get("id")
@@ -553,15 +546,8 @@ def claim_one_message(chat_id):
         text = snippet.get("displayMessage", "").strip()
         if not published_at or not text:
             continue
-        saved = existing.get(message_key(message_id))
-        if saved:
-            status = saved.get("status")
-            stale = (
-                status == "processing"
-                and now - float(saved.get("claimedAt", 0)) > 300
-            )
-            if status not in ("pending", "failed") and not stale:
-                continue
+        if (published_at, message_id) <= cursor:
+            continue
         author = item.get("authorDetails", {}).get("displayName", "viewer")
         candidates.append(
             {
@@ -603,7 +589,7 @@ def send_card(stream, lifecycle, card, stop):
                 return False
             raise RuntimeError("YouTube did not accept ingest within 75 seconds.")
 
-        hold_seconds = max(2, min(10, int(os.environ.get("CARD_SECONDS", "3"))))
+        hold_seconds = max(8, min(20, int(os.environ.get("CARD_SECONDS", "10"))))
         displayed = not stop.wait(hold_seconds)
         return displayed
     finally:
@@ -649,12 +635,12 @@ def run_stream_job(stop):
         candidate = claim_one_message(chat_id)
         if candidate is None or stop.is_set():
             if candidate is not None:
-                finish_claim(candidate, "pending", retryReason="superseded")
+                finish_claim(candidate, answered=False)
             return
         try:
             answer = exa_answer(candidate["text"], lambda _current: None)
             if stop.is_set():
-                finish_claim(candidate, "pending", retryReason="superseded")
+                finish_claim(candidate, answered=False)
                 return
             answer = answer or "I couldn’t produce an answer for that message."
             card = {
@@ -665,18 +651,13 @@ def run_stream_job(stop):
             }
             displayed = send_card(stream, lifecycle, card, stop)
             if displayed:
-                finish_claim(
-                    candidate,
-                    "answered",
-                    answer=answer,
-                    answeredAt=utc_now(),
-                )
+                finish_claim(candidate, answered=True)
                 with status_lock:
                     runtime_status["processedThisRun"] = 1
             else:
-                finish_claim(candidate, "pending", retryReason="superseded")
+                finish_claim(candidate, answered=False)
         except Exception as exc:
-            finish_claim(candidate, "pending", retryReason=str(exc)[:300])
+            finish_claim(candidate, answered=False)
             raise
     except Exception as exc:
         print(f"Stream job failed: {exc}", file=sys.stderr, flush=True)
@@ -711,7 +692,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, payload)
 
     def do_POST(self):
-        if self.path.split("?", 1)[0] != "/tick":
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/tick":
             self.send_json(404, {"error": "not_found"})
             return
         expected = required("CRON_SHARED_SECRET")
@@ -719,6 +701,25 @@ class Handler(BaseHTTPRequestHandler):
         if supplied != "Bearer " + expected:
             self.send_json(401, {"error": "unauthorized"})
             return
+        try:
+            delay = int(urllib.parse.parse_qs(parsed.query).get("delay", ["0"])[0])
+        except ValueError:
+            self.send_json(400, {"error": "invalid_delay"})
+            return
+        if delay not in (0, 30):
+            self.send_json(400, {"error": "invalid_delay"})
+            return
+        if delay:
+            threading.Thread(
+                target=self.start_after_delay, args=(delay,), daemon=True
+            ).start()
+            self.send_json(202, {"ok": True, "started": False, "scheduledIn": delay})
+            return
+        replaced = self.start_job()
+        self.send_json(202, {"ok": True, "started": True, "replaced": replaced})
+
+    @staticmethod
+    def start_job():
         global current_stop
         with request_lock:
             replaced = current_stop is not None and not current_stop.is_set()
@@ -728,7 +729,12 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(
                 target=run_stream_job, args=(current_stop,), daemon=True
             ).start()
-        self.send_json(202, {"ok": True, "started": True, "replaced": replaced})
+        return replaced
+
+    @classmethod
+    def start_after_delay(cls, delay):
+        time.sleep(delay)
+        cls.start_job()
 
     def log_message(self, fmt, *args):
         print(f"{self.client_address[0]} {fmt % args}", flush=True)
