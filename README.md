@@ -5,10 +5,16 @@ ingest stream, answers at most three previously unseen live-chat messages per
 run through the Exa demo endpoint, and renders the current question and answer
 into a generated 720p video feed.
 
-Each authenticated `POST /tick` starts at most one background stream job.
-The default job lasts 270 seconds and deliberately does **not** complete the
-YouTube broadcast. A five-minute cron therefore reconnects to the same watch
-page with a short buffering gap.
+Each authenticated `POST /tick` reads up to three unseen messages, generates
+their answers, reconnects long enough to show each response card, and then
+stops ingest without completing the YouTube broadcast. With no new messages it
+briefly resends the latest card. Buffering between five-minute cron calls is
+expected.
+
+If a tick arrives while an older run is still working, the newer invocation
+signals the old run to stop and takes the single encoder lock as soon as the old
+RTMP connection closes. This gives the newest cron invocation precedence
+without opening two simultaneous connections to the same YouTube stream key.
 
 ## State
 
@@ -27,4 +33,3 @@ chat history may be considered again.
 
 See `render.yaml`. `YOUTUBE_STREAM_ID` must identify a reusable stream and
 `YOUTUBE_BROADCAST_ID` must identify a non-completed broadcast bound to it.
-

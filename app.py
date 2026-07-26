@@ -6,7 +6,6 @@ import datetime as dt
 import json
 import math
 import os
-import queue
 import shutil
 import signal
 import subprocess
@@ -44,7 +43,9 @@ BOLD_FONT = next(
 )
 
 job_lock = threading.Lock()
+request_lock = threading.Lock()
 status_lock = threading.Lock()
+current_stop = None
 runtime_status = {
     "running": False,
     "startedAt": None,
@@ -482,63 +483,109 @@ def chat_messages(chat_id, page_token=None):
     return youtube_api("GET", "/liveChat/messages", params)
 
 
-def answer_up_to_three(chat_id, state, stop):
+def generate_up_to_three(chat_id, stop):
     processed = load_processed()
     processed_set = set(processed)
-    page_token = None
     count = 0
-    while not stop.is_set() and count < 3:
-        response = chat_messages(chat_id, page_token)
-        page_token = response.get("nextPageToken", page_token)
-        candidates = []
-        for item in response.get("items", []):
-            message_id = item.get("id")
-            snippet = item.get("snippet", {})
-            if (
-                not message_id
-                or message_id in processed_set
-                or snippet.get("type") != "textMessageEvent"
-            ):
-                continue
-            text = snippet.get("displayMessage", "").strip()
-            if not text:
-                continue
-            author = item.get("authorDetails", {}).get("displayName", "viewer")
-            candidates.append((snippet.get("publishedAt", ""), message_id, author, text))
-        candidates.sort()
-        for _published, message_id, author, text in candidates:
-            if count >= 3 or stop.is_set():
+    cards = []
+    response = chat_messages(chat_id)
+    candidates = []
+    for item in response.get("items", []):
+        message_id = item.get("id")
+        snippet = item.get("snippet", {})
+        if (
+            not message_id
+            or message_id in processed_set
+            or snippet.get("type") != "textMessageEvent"
+        ):
+            continue
+        text = snippet.get("displayMessage", "").strip()
+        if not text:
+            continue
+        author = item.get("authorDetails", {}).get("displayName", "viewer")
+        candidates.append((snippet.get("publishedAt", ""), message_id, author, text))
+    candidates.sort()
+    for _published, message_id, author, text in candidates[:3]:
+        if stop.is_set():
+            break
+        processed.append(message_id)
+        processed_set.add(message_id)
+        save_local_state(processed)
+        count += 1
+        with status_lock:
+            runtime_status["processedThisRun"] = count
+        try:
+            answer = exa_answer(text, lambda _current: None)
+            answer = answer or "I couldn’t produce an answer for that message."
+            card_status = "ANSWERED"
+        except Exception as exc:
+            print(f"LLM error for {message_id}: {exc}", file=sys.stderr, flush=True)
+            answer = "The AI service is temporarily unavailable."
+            card_status = "ERROR"
+        card = {
+            "author": author,
+            "question": text,
+            "answer": answer,
+            "status": card_status,
+        }
+        cards.append(card)
+        saved_state = ScreenState()
+        saved_state.set(**card)
+        save_local_state(processed, saved_state)
+    return cards
+
+
+def send_cards(stream, lifecycle, cards, stop):
+    state = ScreenState()
+    if cards:
+        state.set(**cards[0])
+    else:
+        state.set(status="LATEST")
+    process = subprocess.Popen(ffmpeg_command(stream), stdin=subprocess.PIPE)
+    feeder = threading.Thread(
+        target=feed_video, args=(process, state, stop), daemon=True
+    )
+    feeder.start()
+    try:
+        deadline = time.time() + 75
+        while time.time() < deadline and not stop.is_set():
+            if process.poll() is not None:
+                raise RuntimeError("FFmpeg stopped before YouTube accepted the feed.")
+            current = get_stream().get("status", {}).get("streamStatus")
+            if current == "active":
+                if lifecycle != "live":
+                    transition("live")
                 break
-            processed.append(message_id)
-            processed_set.add(message_id)
-            save_local_state(processed)
-            count += 1
-            with status_lock:
-                runtime_status["processedThisRun"] = count
-            state.set(author=author, question=text, answer="Thinking…", status="THINKING")
+            stop.wait(3)
+        else:
+            if stop.is_set():
+                return
+            raise RuntimeError("YouTube did not accept ingest within 75 seconds.")
+
+        hold_seconds = max(5, min(30, int(os.environ.get("CARD_SECONDS", "12"))))
+        if cards:
+            for card in cards:
+                if stop.is_set():
+                    break
+                state.set(**card)
+                stop.wait(hold_seconds)
+        else:
+            stop.wait(max(5, min(15, int(os.environ.get("IDLE_SECONDS", "8")))))
+    finally:
+        stop.set()
+        feeder.join(timeout=3)
+        if process.poll() is None:
+            process.send_signal(signal.SIGINT)
             try:
-                answer = exa_answer(
-                    text,
-                    lambda current: state.set(answer=current or "Thinking…", status="ANSWERING"),
-                )
-                state.set(
-                    answer=answer or "I couldn’t produce an answer for that message.",
-                    status="LISTENING",
-                )
-                save_local_state(processed, state)
-            except Exception as exc:
-                print(f"LLM error for {message_id}: {exc}", file=sys.stderr, flush=True)
-                state.set(answer="The AI service is temporarily unavailable.", status="ERROR")
-                save_local_state(processed, state)
-        wait_seconds = max(
-            1.0, float(response.get("pollingIntervalMillis", 3000)) / 1000
-        )
-        stop.wait(wait_seconds)
-    return count
+                process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                process.terminate()
 
 
-def run_stream_job():
-    if not job_lock.acquire(blocking=False):
+def run_stream_job(stop):
+    job_lock.acquire()
+    if stop.is_set():
+        job_lock.release()
         return
     with status_lock:
         runtime_status.update(
@@ -549,11 +596,7 @@ def run_stream_job():
                 "processedThisRun": 0,
             }
         )
-    stop = threading.Event()
-    process = None
-    feeder = None
     try:
-        seconds = max(30, min(285, int(os.environ.get("JOB_SECONDS", "270"))))
         broadcast = get_broadcast()
         lifecycle = broadcast.get("status", {}).get("lifeCycleStatus")
         if lifecycle == "complete":
@@ -568,47 +611,15 @@ def run_stream_job():
         chat_id = broadcast.get("snippet", {}).get("liveChatId")
         if not chat_id:
             raise RuntimeError("Broadcast has no live chat ID.")
-
-        state = ScreenState()
-        process = subprocess.Popen(ffmpeg_command(stream), stdin=subprocess.PIPE)
-        feeder = threading.Thread(
-            target=feed_video, args=(process, state, stop), daemon=True
-        )
-        feeder.start()
-
-        deadline = time.time() + 90
-        while time.time() < deadline:
-            if process.poll() is not None:
-                raise RuntimeError("FFmpeg stopped before YouTube accepted the feed.")
-            current = get_stream().get("status", {}).get("streamStatus")
-            if current == "active":
-                if lifecycle != "live":
-                    transition("live")
-                break
-            stop.wait(4)
-        else:
-            raise RuntimeError("YouTube did not accept ingest within 90 seconds.")
-
-        state.set(status="LISTENING")
-        worker = threading.Thread(
-            target=answer_up_to_three, args=(chat_id, state, stop), daemon=True
-        )
-        worker.start()
-        stop.wait(seconds)
+        cards = generate_up_to_three(chat_id, stop)
+        if not stop.is_set():
+            send_cards(stream, lifecycle, cards, stop)
     except Exception as exc:
         print(f"Stream job failed: {exc}", file=sys.stderr, flush=True)
         with status_lock:
             runtime_status["lastError"] = str(exc)
     finally:
         stop.set()
-        if feeder:
-            feeder.join(timeout=3)
-        if process and process.poll() is None:
-            process.send_signal(signal.SIGINT)
-            try:
-                process.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                process.terminate()
         with status_lock:
             runtime_status["running"] = False
             runtime_status["lastFinishedAt"] = dt.datetime.now(
@@ -644,11 +655,16 @@ class Handler(BaseHTTPRequestHandler):
         if supplied != "Bearer " + expected:
             self.send_json(401, {"error": "unauthorized"})
             return
-        if job_lock.locked():
-            self.send_json(200, {"ok": True, "started": False, "reason": "already_running"})
-            return
-        threading.Thread(target=run_stream_job, daemon=True).start()
-        self.send_json(202, {"ok": True, "started": True})
+        global current_stop
+        with request_lock:
+            replaced = current_stop is not None and not current_stop.is_set()
+            if replaced:
+                current_stop.set()
+            current_stop = threading.Event()
+            threading.Thread(
+                target=run_stream_job, args=(current_stop,), daemon=True
+            ).start()
+        self.send_json(202, {"ok": True, "started": True, "replaced": replaced})
 
     def log_message(self, fmt, *args):
         print(f"{self.client_address[0]} {fmt % args}", flush=True)

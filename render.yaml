@@ -19,8 +19,10 @@ services:
         sync: false
       - key: CRON_SHARED_SECRET
         sync: false
-      - key: JOB_SECONDS
-        value: "270"
+      - key: CARD_SECONDS
+        value: "12"
+      - key: IDLE_SECONDS
+        value: "8"
       - key: EXA_ENDPOINT
         value: https://demos.exa.ai/chatbot-demo/api/chat/stream
       - key: EXA_MODEL
