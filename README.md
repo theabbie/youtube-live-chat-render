@@ -19,9 +19,11 @@ without opening two simultaneous connections to the same YouTube stream key.
 ## State
 
 YouTube resource IDs and OAuth credentials are Render environment variables.
-A bounded list of processed chat IDs is kept in `/tmp` and survives ordinary
-cron calls but not a Render restart or redeploy. Following a restart, existing
-chat history may be considered again.
+The service keeps the latest processed `publishedAt` timestamp plus a bounded
+set of message IDs in `/tmp`. The timestamp identifies newly published chat;
+IDs disambiguate multiple messages with the same timestamp. This state survives
+ordinary cron calls but not a Render restart or redeploy. A fresh instance sets
+its baseline to its startup run, deliberately ignoring older chat history.
 
 ## Endpoints
 

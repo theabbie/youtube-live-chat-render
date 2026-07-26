@@ -196,17 +196,20 @@ def load_processed():
     return list(load_local_state().get("processedMessageIds", []))[-500:]
 
 
-def save_local_state(ids, state=None):
-    display = load_local_state().get("display", {})
+def save_local_state(ids, state=None, last_processed_at=None):
+    current = load_local_state()
+    display = current.get("display", {})
     if state:
         author, question, answer, _status, _version = state.get()
         display = {"author": author, "question": question, "answer": answer}
+    cursor = last_processed_at or current.get("lastProcessedAt")
     temp = STATE_FILE.with_suffix(".tmp")
     temp.write_text(
         json.dumps(
             {
                 "processedMessageIds": list(ids)[-500:],
                 "display": display,
+                "lastProcessedAt": cursor,
                 "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
             }
         )
@@ -484,8 +487,15 @@ def chat_messages(chat_id, page_token=None):
 
 
 def generate_up_to_three(chat_id, stop):
-    processed = load_processed()
+    local_state = load_local_state()
+    processed = list(local_state.get("processedMessageIds", []))[-500:]
     processed_set = set(processed)
+    last_processed_at = local_state.get("lastProcessedAt")
+    if not last_processed_at:
+        last_processed_at = dt.datetime.now(dt.timezone.utc).isoformat(
+            timespec="milliseconds"
+        ).replace("+00:00", "Z")
+        save_local_state(processed, last_processed_at=last_processed_at)
     count = 0
     cards = []
     response = chat_messages(chat_id)
@@ -499,18 +509,23 @@ def generate_up_to_three(chat_id, stop):
             or snippet.get("type") != "textMessageEvent"
         ):
             continue
+        published_at = snippet.get("publishedAt", "")
+        if not published_at or published_at < last_processed_at:
+            continue
         text = snippet.get("displayMessage", "").strip()
         if not text:
             continue
         author = item.get("authorDetails", {}).get("displayName", "viewer")
-        candidates.append((snippet.get("publishedAt", ""), message_id, author, text))
+        candidates.append((published_at, message_id, author, text))
     candidates.sort()
-    for _published, message_id, author, text in candidates[:3]:
+    for published_at, message_id, author, text in candidates[:3]:
         if stop.is_set():
             break
         processed.append(message_id)
         processed_set.add(message_id)
-        save_local_state(processed)
+        if published_at > last_processed_at:
+            last_processed_at = published_at
+        save_local_state(processed, last_processed_at=last_processed_at)
         count += 1
         with status_lock:
             runtime_status["processedThisRun"] = count
@@ -531,7 +546,9 @@ def generate_up_to_three(chat_id, stop):
         cards.append(card)
         saved_state = ScreenState()
         saved_state.set(**card)
-        save_local_state(processed, saved_state)
+        save_local_state(
+            processed, saved_state, last_processed_at=last_processed_at
+        )
     return cards
 
 
