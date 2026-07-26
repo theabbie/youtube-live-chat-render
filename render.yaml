@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: youtube-live-chat-ai
+    runtime: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: YOUTUBE_CLIENT_ID
+        sync: false
+      - key: YOUTUBE_CLIENT_SECRET
+        sync: false
+      - key: YOUTUBE_REFRESH_TOKEN
+        sync: false
+      - key: YOUTUBE_BROADCAST_ID
+        sync: false
+      - key: YOUTUBE_STREAM_ID
+        sync: false
+      - key: CRON_SHARED_SECRET
+        sync: false
+      - key: JOB_SECONDS
+        value: "270"
+      - key: EXA_ENDPOINT
+        value: https://demos.exa.ai/chatbot-demo/api/chat/stream
+      - key: EXA_MODEL
+        value: google/gemini-2.5-flash
