@@ -596,7 +596,7 @@ def send_card(stream, lifecycle, card, stop):
                 raise RuntimeError("FFmpeg stopped before YouTube accepted the feed.")
             current = get_stream().get("status", {}).get("streamStatus")
             if current == "active":
-                if lifecycle != "live":
+                if lifecycle not in ("live", "liveStarting"):
                     transition("live")
                 break
             stop.wait(3)
@@ -604,6 +604,26 @@ def send_card(stream, lifecycle, card, stop):
             if stop.is_set():
                 return False
             raise RuntimeError("YouTube did not accept ingest within 75 seconds.")
+
+        if lifecycle != "live":
+            live_deadline = time.time() + 60
+            while time.time() < live_deadline and not stop.is_set():
+                current_lifecycle = (
+                    get_broadcast().get("status", {}).get("lifeCycleStatus")
+                )
+                if current_lifecycle == "live":
+                    break
+                if current_lifecycle == "complete":
+                    raise RuntimeError(
+                        "YouTube completed the broadcast during its live transition."
+                    )
+                stop.wait(2)
+            else:
+                if stop.is_set():
+                    return False
+                raise RuntimeError(
+                    "YouTube did not finish the live transition within 60 seconds."
+                )
 
         hold_seconds = max(8, min(20, int(os.environ.get("CARD_SECONDS", "10"))))
         displayed = not stop.wait(hold_seconds)
@@ -640,7 +660,7 @@ def run_stream_job(stop):
             raise RuntimeError(
                 "Configured broadcast is complete; replace YOUTUBE_BROADCAST_ID."
             )
-        if lifecycle not in ("ready", "testing", "live"):
+        if lifecycle not in ("ready", "testing", "liveStarting", "live"):
             raise RuntimeError(f"Broadcast is not resumable from state: {lifecycle}")
         stream = get_stream()
         if not stream.get("contentDetails", {}).get("isReusable"):
