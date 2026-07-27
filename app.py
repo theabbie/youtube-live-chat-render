@@ -364,9 +364,6 @@ def render_frame(state, now):
         ((1040, 0), (1280, 0), (1280, 720), (1180, 720)),
         fill=(24, 24, 27, 120),
     )
-    for y in range(0, HEIGHT, 36):
-        draw.line((0, y, WIDTH, y), fill=(255, 255, 255, 5), width=1)
-
     regular = ImageFont.truetype(REGULAR_FONT, 23)
     label = ImageFont.truetype(BOLD_FONT, 18)
     title = ImageFont.truetype(BOLD_FONT, 25)
