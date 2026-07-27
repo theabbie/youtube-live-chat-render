@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Cron-triggered, resumable YouTube Live chat-to-AI video service."""
 
-import colorsys
 import datetime as dt
 import json
 import math
@@ -239,7 +238,7 @@ def claim_message(candidate):
     return None
 
 
-def finish_claim(candidate, answered):
+def finish_claim(candidate, answered, card=None):
     claim_token = candidate["claim_token"]
 
     def transaction(current):
@@ -252,6 +251,11 @@ def finish_claim(candidate, answered):
         if answered:
             current["lastRespondedMessageId"] = candidate["message_id"]
             current["lastRespondedPublishedAt"] = candidate["published_at"]
+            current["latestCard"] = {
+                "author": card["author"],
+                "question": card["question"],
+                "answer": card["answer"],
+            }
         return current
 
     state_ref().transaction(transaction)
@@ -347,90 +351,85 @@ def fit_text(draw, text, font_path, max_width, max_height, start_size, min_size)
 
 
 def render_frame(state, now):
-    hue = (now * 0.008) % 1.0
-    left = tuple(int(x * 255) for x in colorsys.hsv_to_rgb(hue, 0.70, 0.16))
-    right = tuple(
-        int(x * 255) for x in colorsys.hsv_to_rgb((hue + 0.14) % 1, 0.68, 0.27)
-    )
-    strip = Image.new("RGB", (WIDTH, 1))
-    pixels = strip.load()
-    for x in range(WIDTH):
-        mix = x / (WIDTH - 1)
-        pixels[x, 0] = tuple(
-            int(left[index] * (1 - mix) + right[index] * mix)
-            for index in range(3)
-        )
-    image = strip.resize((WIDTH, HEIGHT)).convert("RGBA")
-    glow = Image.new("RGBA", image.size, (0, 0, 0, 0))
-    glow_draw = ImageDraw.Draw(glow)
-    center_x = int(WIDTH * (0.5 + 0.30 * math.sin(now * 0.13)))
-    center_y = int(HEIGHT * (0.5 + 0.26 * math.cos(now * 0.11)))
-    glow_draw.ellipse(
-        (center_x - 360, center_y - 360, center_x + 360, center_y + 360),
-        fill=(100, 168, 255, 40),
-    )
-    image = Image.alpha_composite(image, glow)
+    image = Image.new("RGBA", (WIDTH, HEIGHT), (9, 9, 11, 255))
     draw = ImageDraw.Draw(image, "RGBA")
     author, question, answer, status, _version = state.get()
-    regular = ImageFont.truetype(REGULAR_FONT, 25)
-    label = ImageFont.truetype(BOLD_FONT, 20)
-    title = ImageFont.truetype(BOLD_FONT, 30)
+    phase = (math.sin(now * 0.16) + 1) / 2
+    glow_x = int(820 + 180 * phase)
+    draw.ellipse(
+        (glow_x - 520, -560, glow_x + 520, 480),
+        fill=(30, 41, 59, 72),
+    )
+    draw.polygon(
+        ((1040, 0), (1280, 0), (1280, 720), (1180, 720)),
+        fill=(24, 24, 27, 120),
+    )
+    for y in range(0, HEIGHT, 36):
+        draw.line((0, y, WIDTH, y), fill=(255, 255, 255, 5), width=1)
 
-    draw.rounded_rectangle(
-        (54, 42, 1226, 678),
-        radius=32,
-        fill=(8, 12, 24, 210),
-        outline=(255, 255, 255, 40),
-        width=2,
-    )
-    draw.text((90, 75), "LIVE CHAT × AI", font=title, fill="white")
-    status_width = draw.textlength(status, font=label) + 34
-    draw.rounded_rectangle(
-        (1190 - status_width, 69, 1190, 108),
-        radius=20,
-        fill=(74, 222, 128, 42),
-        outline=(74, 222, 128, 110),
-    )
+    regular = ImageFont.truetype(REGULAR_FONT, 23)
+    label = ImageFont.truetype(BOLD_FONT, 18)
+    title = ImageFont.truetype(BOLD_FONT, 25)
+    number = ImageFont.truetype(BOLD_FONT, 116)
+
+    draw.text((66, 48), "CHAT / SIGNAL", font=title, fill=(244, 244, 245, 255))
+    draw.ellipse((1090, 57, 1104, 71), fill=(34, 211, 238, 255))
     draw.text(
-        (1207 - status_width, 78),
+        (1122, 54),
         status,
         font=label,
-        fill=(150, 255, 193, 255),
+        fill=(161, 161, 170, 255),
     )
+    draw.text((1080, 86), "01", font=number, fill=(255, 255, 255, 12))
+    draw.line((67, 124, 67, 616), fill=(63, 63, 70, 255), width=2)
+    draw.line((67, 124, 67, 208), fill=(34, 211, 238, 255), width=4)
+
     draw.text(
-        (90, 155),
+        (108, 142),
         author if author else "VIEWER",
         font=label,
-        fill=(137, 191, 255, 255),
+        fill=(161, 161, 170, 255),
     )
     question_text, question_font = fit_text(
-        draw, question, BOLD_FONT, 1090, 120, 38, 28
+        draw, question, BOLD_FONT, 1030, 142, 46, 30
     )
     draw.multiline_text(
-        (90, 190), question_text, font=question_font, spacing=9, fill="white"
+        (108, 178),
+        question_text,
+        font=question_font,
+        spacing=10,
+        fill=(250, 250, 250, 255),
     )
-    draw.line((90, 340, 1190, 340), fill=(255, 255, 255, 35), width=2)
+    draw.line((108, 348, 1188, 348), fill=(63, 63, 70, 170), width=1)
     draw.text(
-        (90, 376),
-        os.environ.get("EXA_MODEL", "google/gemini-2.5-flash").upper(),
+        (108, 378),
+        "RESPONSE",
         font=label,
-        fill=(192, 163, 255, 255),
+        fill=(34, 211, 238, 255),
     )
     answer_text, answer_font = fit_text(
-        draw, answer, REGULAR_FONT, 1090, 205, 34, 23
+        draw, answer, REGULAR_FONT, 1030, 205, 35, 24
     )
     draw.multiline_text(
-        (90, 414),
+        (108, 418),
         answer_text,
         font=answer_font,
-        spacing=11,
-        fill=(235, 238, 247, 255),
+        spacing=12,
+        fill=(212, 212, 216, 255),
     )
     draw.text(
-        (90, 630),
-        "Send a message in YouTube chat • No command prefix required",
+        (108, 655),
+        "Send any message in live chat",
         font=regular,
-        fill=(255, 255, 255, 130),
+        fill=(113, 113, 122, 255),
+    )
+    model = os.environ.get("EXA_MODEL", "google/gemini-2.5-flash")
+    model_width = draw.textlength(model, font=regular)
+    draw.text(
+        (1188 - model_width, 655),
+        model,
+        font=regular,
+        fill=(82, 82, 91, 255),
     )
     return image.convert("RGB")
 
@@ -564,6 +563,23 @@ def claim_one_message(chat_id):
     return None
 
 
+def latest_card():
+    card = (state_ref().get() or {}).get("latestCard")
+    if not card:
+        return {
+            "author": "WELCOME",
+            "question": "The chat is quiet.",
+            "answer": "Send a message and the next response will appear here.",
+            "status": "KEEPALIVE",
+        }
+    return {
+        "author": card.get("author", "VIEWER"),
+        "question": card.get("question", ""),
+        "answer": card.get("answer", ""),
+        "status": "LATEST",
+    }
+
+
 def send_card(stream, lifecycle, card, stop):
     state = ScreenState()
     state.set(**card)
@@ -633,9 +649,12 @@ def run_stream_job(stop):
         if not chat_id:
             raise RuntimeError("Broadcast has no live chat ID.")
         candidate = claim_one_message(chat_id)
-        if candidate is None or stop.is_set():
-            if candidate is not None:
+        if stop.is_set():
+            if candidate:
                 finish_claim(candidate, answered=False)
+            return
+        if candidate is None:
+            send_card(stream, lifecycle, latest_card(), stop)
             return
         try:
             answer = exa_answer(candidate["text"], lambda _current: None)
@@ -651,7 +670,7 @@ def run_stream_job(stop):
             }
             displayed = send_card(stream, lifecycle, card, stop)
             if displayed:
-                finish_claim(candidate, answered=True)
+                finish_claim(candidate, answered=True, card=card)
                 with status_lock:
                     runtime_status["processedThisRun"] = 1
             else:

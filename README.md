@@ -6,9 +6,10 @@ through Firebase Realtime Database, answers it through the Exa demo endpoint,
 and renders the question and answer into a generated 720p video feed.
 
 Each authenticated `POST /tick` claims at most one message, generates its
-answer, reconnects only long enough to show that response card, and stops ingest
-without completing the YouTube broadcast. With no unanswered message it exits
-without starting FFmpeg. Buffering between cron calls is expected.
+answer, reconnects long enough to show that response card, and stops ingest
+without completing the YouTube broadcast. With no unanswered message it
+re-streams the latest card as a keepalive. Buffering between cron calls is
+expected.
 
 If a tick arrives while an older run is still working, the newer invocation
 signals the old run to stop and takes the single encoder lock as soon as the old
@@ -18,11 +19,11 @@ without opening two simultaneous connections to the same YouTube stream key.
 ## State and concurrency
 
 YouTube resource IDs and OAuth credentials are Render environment variables.
-Firebase stores only the last answered message ID and publication timestamp,
-plus a temporary processing lease while a response is in flight. No chat text,
-usernames, or generated answers are retained. Transactional claims prevent
-overlapping workers from answering the same message; abandoned leases can be
-reclaimed after five minutes.
+Firebase stores the last answered message ID and publication timestamp, the
+single latest question/answer card, and a temporary processing lease while a
+response is in flight. Older chat content is not retained. Transactional claims
+prevent overlapping workers from answering the same message; abandoned leases
+can be reclaimed after five minutes.
 
 ## Endpoints
 
